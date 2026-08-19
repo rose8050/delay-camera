@@ -30,13 +30,15 @@ jobs:
           -scheme DelayCamera \
           -sdk iphoneos \
           -configuration Release \
+          -derivedDataPath build \
           CODE_SIGNING_ALLOWED=NO \
           CODE_SIGNING_REQUIRED=NO \
           CODE_SIGN_IDENTITY="" \
           build
 
+        # 빌드된 .app을 IPA 압축 파일로 묶기
         mkdir -p Payload
-        cp -r build/Release-iphoneos/DelayCamera.app Payload/
+        cp -r build/Build/Products/Release-iphoneos/DelayCamera.app Payload/
         zip -r DelayCamera.ipa Payload
 
     - name: Upload IPA
