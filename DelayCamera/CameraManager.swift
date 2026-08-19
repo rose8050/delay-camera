@@ -523,11 +523,11 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
 
         VTCompressionSessionEncodeFrameWithOutputHandler(
             compressionSession,
-            imageBuffer: pixelBuffer,
-            presentationTimeStamp: presentationTime,
-            duration: .invalid,
-            frameProperties: nil,
-            infoFlagsOut: nil
+            pixelBuffer,
+            presentationTime,
+            .invalid,
+            nil,
+            nil
         ) { [weak self] status, _, encodedBuffer in
             guard let self, status == noErr,
                   let encodedBuffer, CMSampleBufferDataIsReady(encodedBuffer) else { return }
