@@ -370,13 +370,13 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         guard let compressionSession else { return }
         let hostTime = CACurrentMediaTime()
 
-        VTCompressionSessionEncodeFrameWithOutputHandler(
+        _ = VTCompressionSessionEncodeFrame(
             compressionSession,
-            pixelBuffer,
-            presentationTime,
-            .invalid,
-            nil,
-            nil
+            imageBuffer: pixelBuffer,
+            presentationTimeStamp: presentationTime,
+            duration: .invalid,
+            frameProperties: nil,
+            infoFlagsOut: nil
         ) { [weak self] status, _, encodedBuffer in
             guard let self, status == noErr,
                   let encodedBuffer, CMSampleBufferDataIsReady(encodedBuffer) else { return }
