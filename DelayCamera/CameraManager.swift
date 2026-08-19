@@ -10,7 +10,7 @@ import Combine
 ///   Camera input (후면 카메라 고정, portrait, 720x1280 @ 60fps)
 ///        ├─ video ──> H.264 압축(VTCompressionSession) ──> 지연 링버퍼 ──(N초 후 drain)──┬──> displayLayer (항상)
 ///        │                                                                              └──> AVAssetWriter video (녹화 중일 때만, passthrough — 재인코딩 없음)
-///        └─ audio ──> 원본 그대로 ──> 지연 링버퍼 ──(같은 N초 기준 drain)──> AVAssetWriter audio (녹화 중일 때만)
+///        └─ audio ──> 원본 그대로 ──> 지연 링버퍼 ──(같은 N초 기준 drain)──> AVAssetWriter audio (녹화 중일 때만, AAC로 트랜스코드)
 final class CameraManager: NSObject, ObservableObject {
 
     // MARK: Published UI state
@@ -38,12 +38,6 @@ final class CameraManager: NSObject, ObservableObject {
 
     private var discoveredFrameWidth: Int32?
     private var discoveredFrameHeight: Int32?
-
-    /// 첫 오디오 샘플에서 알아낸 실제 포맷. 오디오 writer input을 만들 때 이 값을
-    /// `sourceFormatHint`로 넘겨서, writer가 나중에 들어오는 버퍼를 보고 포맷을
-    /// 추론하는 대신 처음부터 정확한 포맷을 알고 시작하게 한다.
-    private var discoveredAudioFormatDescription: CMFormatDescription?
-    private let audioFormatLock = NSLock()
 
     // MARK: Delay buffer
 
@@ -283,10 +277,6 @@ final class CameraManager: NSObject, ObservableObject {
             self.discoveredFrameHeight = nil
         }
 
-        audioFormatLock.lock()
-        discoveredAudioFormatDescription = nil
-        audioFormatLock.unlock()
-
         videoDelayBufferLock.lock()
         videoDelayBuffer.removeAll()
         videoDelayBufferLock.unlock()
@@ -414,9 +404,18 @@ final class CameraManager: NSObject, ObservableObject {
                 return
             }
 
+            let audioSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVNumberOfChannelsKey: 1,
+                AVSampleRateKey: 44_100,
+                AVEncoderBitRateKey: 96_000
+            ]
+            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings, sourceFormatHint: nil)
+            audioInput.expectsMediaDataInRealTime = true
+
             self.assetWriter = writer
             self.assetWriterVideoInput = nil
-            self.assetWriterAudioInput = nil
+            self.assetWriterAudioInput = audioInput
             self.writerSessionStarted = false
             self.recordingStartPTS = nil
             self.recordingActive = true
@@ -483,21 +482,8 @@ final class CameraManager: NSObject, ObservableObject {
             writer.add(videoInput)
             assetWriterVideoInput = videoInput
 
-            let audioSettings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVNumberOfChannelsKey: 1,
-                AVSampleRateKey: 48_000,
-                AVEncoderBitRateKey: 96_000
-            ]
-            audioFormatLock.lock()
-            let audioFormatHint = discoveredAudioFormatDescription
-            audioFormatLock.unlock()
-
-            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings, sourceFormatHint: audioFormatHint)
-            audioInput.expectsMediaDataInRealTime = true
-            if writer.canAdd(audioInput) {
+            if let audioInput = assetWriterAudioInput, writer.canAdd(audioInput) {
                 writer.add(audioInput)
-                assetWriterAudioInput = audioInput
             } else {
                 print("[DelayCamera] 오디오 input을 writer에 추가하지 못함 (canAdd == false)")
                 DispatchQueue.main.async { self.errorMessage = "오디오 트랙을 녹화에 추가하지 못했습니다." }
@@ -561,13 +547,6 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
             encodeForDelayBuffer(pixelBuffer: pixelBuffer, presentationTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
         } else {
             let hostTime = CACurrentMediaTime()
-
-            audioFormatLock.lock()
-            if discoveredAudioFormatDescription == nil {
-                discoveredAudioFormatDescription = CMSampleBufferGetFormatDescription(sampleBuffer)
-            }
-            audioFormatLock.unlock()
-
             audioDelayBufferLock.lock()
             audioDelayBuffer.append(BufferedAudioFrame(sampleBuffer: sampleBuffer, captureHostTime: hostTime))
             audioDelayBufferLock.unlock()
