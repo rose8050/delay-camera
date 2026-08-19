@@ -1,6 +1,7 @@
 name: DelayCamera
 options:
   bundleIdPrefix: com.example
+  xcodeVersion: "15.4"
 targets:
   DelayCamera:
     type: application
