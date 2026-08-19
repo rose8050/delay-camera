@@ -1,28 +1,21 @@
 import AVFoundation
+import CoreMedia
+import VideoToolbox
+import QuartzCore
 import Photos
 import Combine
 
-/// 카메라의 실시간 입력을 한 곳(captureOutput 델리게이트)에서 받아
-/// 서로 절대 간섭하지 않는 두 개의 파이프라인으로 분기시킨다.
-///
-///   Camera input
-///        ├──> Delay buffer ──> delayed preview  (항상 동작, 녹화 상태와 무관)
-///        └──> AVAssetWriter ──> saved video file (isRecording == true 인 동안만, 항상 "현재" 프레임을 기록)
-///
-/// 두 파이프라인은 별도의 상태(delay buffer / writer)를 가지며, 한쪽이 다른 쪽을
-/// 멈추거나, 리셋하거나, 값을 바꾸는 일이 없다. 이것이 이 앱의 핵심 불변조건이다.
 final class CameraManager: NSObject, ObservableObject {
 
-    // MARK: Published UI state
+    static let delayPresets: [Double] = [3, 5, 8, 10, 15]
 
-    @Published var delaySeconds: Double = 30.0
+    @Published private(set) var delaySeconds: Double = CameraManager.delayPresets[1]
     @Published var isRecording = false
+    @Published private(set) var recordingStartDate: Date?
     @Published var errorMessage: String?
+    @Published private(set) var cameraPosition: AVCaptureDevice.Position = .back
 
-    /// 지연 프리뷰를 그리는 레이어. 항상 살아있고, 녹화 여부와 무관하게 계속 업데이트된다.
     let displayLayer = AVSampleBufferDisplayLayer()
-
-    // MARK: Capture session
 
     private let session = AVCaptureSession()
     private let videoDataOutput = AVCaptureVideoDataOutput()
@@ -30,19 +23,19 @@ final class CameraManager: NSObject, ObservableObject {
 
     private let captureQueue = DispatchQueue(label: "camera.capture.queue")
 
-    // MARK: Delay buffer pipeline (파이프라인 #1)
+    private static let targetWidth: Int32 = 1280
+    private static let targetHeight: Int32 = 720
+    private static let targetFPS: Double = 60
 
     private struct BufferedFrame {
         let sampleBuffer: CMSampleBuffer
-        let captureHostTime: Double // CACurrentMediaTime() 기준, "이 프레임이 실제로 찍힌 시각"
+        let captureHostTime: Double
     }
 
     private var videoDelayBuffer: [BufferedFrame] = []
     private let delayBufferLock = NSLock()
-    private let delayQueue = DispatchQueue(label: "camera.delay.queue")
-    private var displayTimer: DispatchSourceTimer?
-
-    // MARK: Recording pipeline (파이프라인 #2) — recordingQueue 에서만 접근
+    private var displayLink: CADisplayLink?
+    private var compressionSession: VTCompressionSession?
 
     private let recordingQueue = DispatchQueue(label: "camera.recording.queue")
     private var assetWriter: AVAssetWriter?
@@ -50,8 +43,6 @@ final class CameraManager: NSObject, ObservableObject {
     private var assetWriterAudioInput: AVAssetWriterInput?
     private var recordingStartPTS: CMTime?
     private var writerSessionStarted = false
-    /// isRecording(@Published, main-thread 용 UI 미러)과는 별개로, 실제 프레임을
-    /// writer에 넣을지 말지는 이 플래그로만 판단한다. recordingQueue에서만 읽고 쓴다.
     private var recordingActive = false
 
     override init() {
@@ -59,13 +50,18 @@ final class CameraManager: NSObject, ObservableObject {
         displayLayer.videoGravity = .resizeAspectFill
     }
 
-    // MARK: - Setup
+    deinit {
+        displayLink?.invalidate()
+        if let compressionSession {
+            VTCompressionSessionInvalidate(compressionSession)
+        }
+    }
 
     func configureSession() {
         session.beginConfiguration()
         session.sessionPreset = .hd1280x720
 
-        guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+        guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: cameraPosition),
               let videoInput = try? AVCaptureDeviceInput(device: camera),
               session.canAddInput(videoInput) else {
             session.commitConfiguration()
@@ -73,6 +69,8 @@ final class CameraManager: NSObject, ObservableObject {
             return
         }
         session.addInput(videoInput)
+        applyHighFrameRateFormat(to: camera)
+        session.sessionPreset = .inputPriority
 
         if let mic = AVCaptureDevice.default(for: .audio),
            let audioInput = try? AVCaptureDeviceInput(device: mic),
@@ -86,9 +84,7 @@ final class CameraManager: NSObject, ObservableObject {
         if session.canAddOutput(videoDataOutput) {
             session.addOutput(videoDataOutput)
         }
-        if let connection = videoDataOutput.connection(with: .video), connection.isVideoOrientationSupported {
-            connection.videoOrientation = .portrait
-        }
+        configureVideoConnection()
 
         audioDataOutput.setSampleBufferDelegate(self, queue: captureQueue)
         if session.canAddOutput(audioDataOutput) {
@@ -96,6 +92,68 @@ final class CameraManager: NSObject, ObservableObject {
         }
 
         session.commitConfiguration()
+        setupCompressionSession()
+    }
+
+    private func applyHighFrameRateFormat(to device: AVCaptureDevice) {
+        let candidates = device.formats.filter { format in
+            let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            return dims.width == Self.targetWidth && dims.height == Self.targetHeight
+        }
+        guard let format = candidates.first(where: { $0.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= Self.targetFPS } })
+            ?? candidates.first else { return }
+
+        do {
+            try device.lockForConfiguration()
+            device.activeFormat = format
+            let maxSupportedFPS = format.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 30
+            let fps = min(Self.targetFPS, maxSupportedFPS)
+            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: Int32(fps))
+            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: Int32(fps))
+            device.unlockForConfiguration()
+        } catch {
+        }
+    }
+
+    private func configureVideoConnection() {
+        guard let connection = videoDataOutput.connection(with: .video) else { return }
+        if connection.isVideoOrientationSupported {
+            connection.videoOrientation = .portrait
+        }
+        if connection.isVideoMirroringSupported {
+            connection.isVideoMirrored = (cameraPosition == .front)
+        }
+    }
+
+    private func setupCompressionSession() {
+        var newSession: VTCompressionSession?
+        let status = VTCompressionSessionCreate(
+            allocator: kCFAllocatorDefault,
+            width: Self.targetWidth,
+            height: Self.targetHeight,
+            codecType: kCMVideoCodecType_H264,
+            encoderSpecification: nil,
+            imageBufferAttributes: nil,
+            compressedDataAllocator: nil,
+            outputCallback: nil,
+            refcon: nil,
+            compressionSessionOut: &newSession
+        )
+
+        guard status == noErr, let compressionSession = newSession else {
+            DispatchQueue.main.async { self.errorMessage = "지연 프리뷰 인코더 초기화에 실패했습니다." }
+            return
+        }
+
+        VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Main_AutoLevel)
+        VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
+        VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_AverageBitRate, value: 5_000_000 as CFTypeRef)
+        VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: Self.targetFPS as CFTypeRef)
+        VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: Int(Self.targetFPS) as CFTypeRef)
+        VTCompressionSessionPrepareToEncodeFrames(compressionSession)
+
+        self.compressionSession = compressionSession
     }
 
     func startSession() {
@@ -103,34 +161,66 @@ final class CameraManager: NSObject, ObservableObject {
             guard let self, !self.session.isRunning else { return }
             self.session.startRunning()
         }
-        startDisplayTimer()
+        startDisplayLink()
     }
 
     func stopSession() {
         captureQueue.async { [weak self] in
             self?.session.stopRunning()
         }
-        stopDisplayTimer()
+        stopDisplayLink()
     }
 
-    // MARK: - Delay buffer → delayed preview
+    func switchCamera() {
+        captureQueue.async { [weak self] in
+            guard let self else { return }
+            let newPosition: AVCaptureDevice.Position = self.cameraPosition == .back ? .front : .back
 
-    /// 30fps 정도로 버퍼를 확인해서, "지금 - delaySeconds" 시점을 지난 가장 오래된
-    /// 프레임을 꺼내 화면에 그린다. delay 값이 바뀌어도, 녹화가 시작/종료돼도
-    /// 이 루프의 동작 방식 자체는 전혀 바뀌지 않는다.
-    private func startDisplayTimer() {
-        let timer = DispatchSource.makeTimerSource(queue: delayQueue)
-        timer.schedule(deadline: .now(), repeating: 1.0 / 30.0)
-        timer.setEventHandler { [weak self] in
-            self?.drainDelayBufferIfReady()
+            guard let newDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: newPosition),
+                  let newInput = try? AVCaptureDeviceInput(device: newDevice) else { return }
+
+            self.session.beginConfiguration()
+            defer { self.session.commitConfiguration() }
+
+            guard let currentInput = self.session.inputs
+                .compactMap({ $0 as? AVCaptureDeviceInput })
+                .first(where: { $0.device.hasMediaType(.video) }) else { return }
+
+            self.session.removeInput(currentInput)
+            guard self.session.canAddInput(newInput) else {
+                self.session.addInput(currentInput)
+                return
+            }
+            self.session.addInput(newInput)
+            self.applyHighFrameRateFormat(to: newDevice)
+            self.configureVideoConnection()
+
+            DispatchQueue.main.async { self.cameraPosition = newPosition }
         }
-        timer.resume()
-        displayTimer = timer
     }
 
-    private func stopDisplayTimer() {
-        displayTimer?.cancel()
-        displayTimer = nil
+    func stepDelay(forward: Bool) {
+        guard let index = Self.delayPresets.firstIndex(of: delaySeconds) else {
+            delaySeconds = forward ? Self.delayPresets.last! : Self.delayPresets.first!
+            return
+        }
+        let newIndex = forward ? min(index + 1, Self.delayPresets.count - 1) : max(index - 1, 0)
+        delaySeconds = Self.delayPresets[newIndex]
+    }
+
+    private func startDisplayLink() {
+        let link = CADisplayLink(target: self, selector: #selector(handleDisplayLink))
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+    }
+
+    private func stopDisplayLink() {
+        displayLink?.invalidate()
+        displayLink = nil
+    }
+
+    @objc private func handleDisplayLink() {
+        drainDelayBufferIfReady()
     }
 
     private func drainDelayBufferIfReady() {
@@ -138,24 +228,36 @@ final class CameraManager: NSObject, ObservableObject {
         let delay = delaySeconds
 
         delayBufferLock.lock()
-        var ready: [BufferedFrame] = []
-        while let first = videoDelayBuffer.first, now - first.captureHostTime >= delay {
-            ready.append(videoDelayBuffer.removeFirst())
+        var dueCount = 0
+        for frame in videoDelayBuffer {
+            guard now - frame.captureHostTime >= delay else { break }
+            dueCount += 1
         }
-        // delay 값을 사용자가 갑자기 줄인 경우를 대비한 안전장치: 무한정 쌓이지 않게
-        // 버퍼 길이를 (delay + 5초) 로 상한을 둔다. (조회 방식 자체는 바꾸지 않는다)
-        let maxAge = delay + 5
-        while let first = videoDelayBuffer.first, now - first.captureHostTime > maxAge {
-            videoDelayBuffer.removeFirst()
+        guard dueCount > 0 else {
+            delayBufferLock.unlock()
+            return
         }
+        let dueFrames = Array(videoDelayBuffer[0..<dueCount])
+        videoDelayBuffer.removeFirst(dueCount)
         delayBufferLock.unlock()
 
-        for frame in ready where displayLayer.isReadyForMoreMediaData {
+        for frame in dueFrames {
+            guard displayLayer.isReadyForMoreMediaData else { break }
+            markForImmediateDisplay(frame.sampleBuffer)
             displayLayer.enqueue(frame.sampleBuffer)
         }
     }
 
-    // MARK: - Recording control (delay buffer에 전혀 손대지 않는다)
+    private func markForImmediateDisplay(_ sampleBuffer: CMSampleBuffer) {
+        guard let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true),
+              CFArrayGetCount(attachmentsArray) > 0 else { return }
+        let dictionary = unsafeBitCast(CFArrayGetValueAtIndex(attachmentsArray, 0), to: CFMutableDictionary.self)
+        CFDictionarySetValue(
+            dictionary,
+            Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+            Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+        )
+    }
 
     func startRecording() {
         recordingQueue.async { [weak self] in
@@ -172,8 +274,12 @@ final class CameraManager: NSObject, ObservableObject {
 
             let videoSettings: [String: Any] = [
                 AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: 1280,
-                AVVideoHeightKey: 720
+                AVVideoWidthKey: Self.targetWidth,
+                AVVideoHeightKey: Self.targetHeight,
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoAverageBitRateKey: 8_000_000,
+                    AVVideoExpectedSourceFrameRateKey: Int(Self.targetFPS)
+                ]
             ]
             let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
             videoInput.expectsMediaDataInRealTime = true
@@ -197,7 +303,10 @@ final class CameraManager: NSObject, ObservableObject {
             self.recordingStartPTS = nil
             self.recordingActive = true
 
-            DispatchQueue.main.async { self.isRecording = true }
+            DispatchQueue.main.async {
+                self.isRecording = true
+                self.recordingStartDate = Date()
+            }
         }
     }
 
@@ -212,7 +321,10 @@ final class CameraManager: NSObject, ObservableObject {
 
             writer?.finishWriting { [weak self] in
                 guard let self else { return }
-                DispatchQueue.main.async { self.isRecording = false }
+                DispatchQueue.main.async {
+                    self.isRecording = false
+                    self.recordingStartDate = nil
+                }
                 if writer?.status == .completed, let url = writer?.outputURL {
                     self.saveToPhotoLibrary(url: url)
                 } else if let error = writer?.error {
@@ -240,25 +352,37 @@ final class CameraManager: NSObject, ObservableObject {
     }
 }
 
-// MARK: - 카메라의 실시간 프레임이 들어오는 단 하나의 지점.
-// 여기서 delay buffer / recorder 두 파이프라인으로 각각 독립적으로 분기(fork)한다.
 extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         let isVideo = (output === videoDataOutput)
 
-        // 1) Delay buffer 파이프라인: 항상 쌓는다. 녹화 중이든 아니든 동일하게 동작한다.
-        if isVideo {
-            let hostTime = CACurrentMediaTime()
-            delayBufferLock.lock()
-            videoDelayBuffer.append(BufferedFrame(sampleBuffer: sampleBuffer, captureHostTime: hostTime))
-            delayBufferLock.unlock()
+        if isVideo, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+            encodeForDelayBuffer(pixelBuffer: pixelBuffer, presentationTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
         }
 
-        // 2) Recording 파이프라인: 녹화 중일 때만, 지금 들어온 "현재" 프레임을 그대로 기록한다.
-        //    delay buffer를 거치지 않고 captureOutput에서 바로 분기되므로 지연의 영향을 받지 않는다.
         recordingQueue.async { [weak self] in
             self?.appendToWriterIfRecording(sampleBuffer: sampleBuffer, isVideo: isVideo)
+        }
+    }
+
+    private func encodeForDelayBuffer(pixelBuffer: CVPixelBuffer, presentationTime: CMTime) {
+        guard let compressionSession else { return }
+        let hostTime = CACurrentMediaTime()
+
+        VTCompressionSessionEncodeFrameWithOutputHandler(
+            compressionSession,
+            imageBuffer: pixelBuffer,
+            presentationTimeStamp: presentationTime,
+            duration: .invalid,
+            frameProperties: nil,
+            infoFlagsOut: nil
+        ) { [weak self] status, _, encodedBuffer in
+            guard let self, status == noErr,
+                  let encodedBuffer, CMSampleBufferDataIsReady(encodedBuffer) else { return }
+            self.delayBufferLock.lock()
+            self.videoDelayBuffer.append(BufferedFrame(sampleBuffer: encodedBuffer, captureHostTime: hostTime))
+            self.delayBufferLock.unlock()
         }
     }
 
@@ -268,7 +392,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
         if !writerSessionStarted {
-            guard isVideo else { return } // 비디오 프레임 기준으로 세션을 시작한다 (오디오가 먼저 도착하면 대기)
+            guard isVideo else { return }
             writer.startWriting()
             writer.startSession(atSourceTime: pts)
             writerSessionStarted = true
