@@ -3,22 +3,12 @@ import UIKit
 
 struct ContentView: View {
     @StateObject private var camera = CameraManager()
-    @State private var isGridVisible = false
     @State private var areControlsVisible = true
-    @State private var isSwitchingCamera = false
-    @State private var switchIconRotation: Double = 0
 
     var body: some View {
         ZStack {
             DelayedPreviewView(displayLayer: camera.displayLayer)
                 .ignoresSafeArea()
-                .opacity(isSwitchingCamera ? 0.15 : 1)
-
-            if isGridVisible {
-                GridOverlayView()
-                    .ignoresSafeArea()
-                    .transition(.opacity)
-            }
 
             edgeScrim
                 .opacity(areControlsVisible ? 1 : 0)
@@ -32,16 +22,6 @@ struct ContentView: View {
                 areControlsVisible.toggle()
             }
         }
-        .gesture(
-            DragGesture(minimumDistance: 40)
-                .onEnded { value in
-                    guard abs(value.translation.width) > abs(value.translation.height) else { return }
-                    Haptics.light()
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-                        camera.stepDelay(forward: value.translation.width < 0)
-                    }
-                }
-        )
         .onAppear {
             camera.configureSession()
             camera.startSession()
@@ -73,37 +53,26 @@ struct ContentView: View {
 
     private var controlsOverlay: some View {
         VStack {
-            HStack {
-                GlassIconButton(systemName: "square.grid.3x3", isActive: isGridVisible) {
-                    Haptics.light()
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
-                        isGridVisible.toggle()
-                    }
-                }
-                Spacer()
-                if camera.isRecording, let startDate = camera.recordingStartDate {
-                    RecordingIndicator(startDate: startDate)
-                        .transition(.scale.combined(with: .opacity))
-                }
-                Spacer()
-                DelayBadge(seconds: Int(camera.delaySeconds))
+            if camera.isRecording, let startDate = camera.recordingStartDate {
+                RecordingIndicator(startDate: startDate)
+                    .padding(.top, 12)
+                    .transition(.scale.combined(with: .opacity))
             }
-            .padding(.horizontal, 20)
-            .padding(.top, 12)
 
             Spacer()
 
-            HStack {
-                Color.clear.frame(width: 44, height: 44)
-                Spacer()
-                RecordButton(isRecording: camera.isRecording, action: toggleRecording)
-                Spacer()
-                GlassIconButton(systemName: "arrow.triangle.2.circlepath.camera", isActive: false) {
-                    switchCamera()
+            VStack(spacing: 18) {
+                DelaySelector(
+                    options: CameraManager.delayPresets,
+                    selected: camera.delaySeconds
+                ) { value in
+                    Haptics.light()
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
+                        camera.setDelay(value)
+                    }
                 }
-                .rotationEffect(.degrees(switchIconRotation))
+                RecordButton(isRecording: camera.isRecording, action: toggleRecording)
             }
-            .padding(.horizontal, 20)
             .padding(.bottom, 28)
         }
         .animation(.spring(response: 0.35, dampingFraction: 0.8), value: camera.isRecording)
@@ -116,22 +85,6 @@ struct ContentView: View {
         } else {
             Haptics.medium()
             camera.startRecording()
-        }
-    }
-
-    private func switchCamera() {
-        Haptics.light()
-        withAnimation(.easeInOut(duration: 0.4)) {
-            switchIconRotation += 180
-        }
-        withAnimation(.easeInOut(duration: 0.18)) {
-            isSwitchingCamera = true
-        }
-        camera.switchCamera()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-            withAnimation(.easeInOut(duration: 0.25)) {
-                isSwitchingCamera = false
-            }
         }
     }
 }
@@ -150,39 +103,41 @@ private struct PressableButtonStyle: ButtonStyle {
     }
 }
 
-private struct GlassIconButton: View {
-    let systemName: String
-    let isActive: Bool
-    let action: () -> Void
+private struct DelaySelector: View {
+    let options: [Double]
+    let selected: Double
+    let onSelect: (Double) -> Void
+    @Namespace private var namespace
 
     var body: some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(isActive ? Color.yellow : Color.white)
-                .frame(width: 44, height: 44)
-                .background(.ultraThinMaterial, in: Circle())
-                .overlay(Circle().strokeBorder(.white.opacity(0.15), lineWidth: 0.5))
-                .shadow(color: .black.opacity(0.2), radius: 6, y: 2)
+        HStack(spacing: 2) {
+            ForEach(options, id: \.self) { value in
+                let isSelected = value == selected
+                Button {
+                    guard !isSelected else { return }
+                    onSelect(value)
+                } label: {
+                    Text("\(Int(value))초")
+                        .font(.system(size: 13, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(isSelected ? Color.black : Color.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background {
+                            if isSelected {
+                                Capsule()
+                                    .fill(Color.white)
+                                    .matchedGeometryEffect(id: "selection", in: namespace)
+                            }
+                        }
+                }
+                .buttonStyle(PressableButtonStyle())
+            }
         }
-        .buttonStyle(PressableButtonStyle())
-    }
-}
-
-private struct DelayBadge: View {
-    let seconds: Int
-
-    var body: some View {
-        Text("\(seconds)초 전")
-            .font(.system(size: 14, weight: .semibold))
-            .monospacedDigit()
-            .contentTransition(.numericText())
-            .foregroundStyle(.white)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .background(.ultraThinMaterial, in: Capsule())
-            .overlay(Capsule().strokeBorder(.white.opacity(0.15), lineWidth: 0.5))
-            .shadow(color: .black.opacity(0.2), radius: 6, y: 2)
+        .padding(4)
+        .background(.ultraThinMaterial, in: Capsule())
+        .overlay(Capsule().strokeBorder(.white.opacity(0.15), lineWidth: 0.5))
+        .shadow(color: .black.opacity(0.2), radius: 6, y: 2)
     }
 }
 
