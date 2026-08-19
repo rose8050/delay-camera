@@ -73,11 +73,8 @@ final class CameraManager: NSObject, ObservableObject {
     private var writerSessionStarted = false
     private var recordingActive = false
 
-    /// writer가 순간적으로 안 준비된 상태여도 샘플을 잃지 않기 위한 대기 큐.
-    /// requestMediaDataWhenReady 콜백과 append 직후 모두 recordingQueue에서만 건드린다.
     private var pendingVideoSamples: [CMSampleBuffer] = []
     private var pendingAudioSamples: [CMSampleBuffer] = []
-    /// 정말 writer가 멈춰버린 극단적 상황(디스크 오류 등)에 대비한 방어적 상한.
     private static let maxPendingSamples = 500
 
     private var debugAudioAppended = 0
@@ -239,7 +236,7 @@ final class CameraManager: NSObject, ObservableObject {
         }
 
         VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-        VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_ProfileLevel, value: kCFProfileLevel_H264_High_AutoLevel)
+        VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
         VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_AverageBitRate, value: 12_000_000 as CFTypeRef)
         VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: Self.targetFPS as CFTypeRef)
@@ -361,7 +358,6 @@ final class CameraManager: NSObject, ObservableObject {
             }
         }
 
-        // 오디오는 비디오보다 훨씬 촘촘하게 들어오므로, 이 틱까지 밀린 것을 전부(개수 제한 없이) 꺼낸다.
         audioDelayBufferLock.lock()
         var audioDueCount = 0
         for frame in audioDelayBuffer {
@@ -460,7 +456,6 @@ final class CameraManager: NSObject, ObservableObject {
                 return
             }
 
-            // 남은 대기 큐를 writer가 받아줄 수 있을 때까지 마저 흘려보낸다.
             self.pumpPendingVideo()
             self.pumpPendingAudio()
 
@@ -486,8 +481,6 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    /// 키프레임이 도착하면 writer 세션을 시작하고, 이후부터는 오디오/비디오 모두
-    /// "대기 큐에 넣고 pump" 방식으로 처리한다. 이후 프레임은 그냥 큐에 쌓기만 한다.
     private func appendDelayedVideoIfRecording(_ sampleBuffer: CMSampleBuffer) {
         guard recordingActive, let writer = assetWriter else { return }
 
@@ -542,8 +535,6 @@ final class CameraManager: NSObject, ObservableObject {
         pumpPendingAudio()
     }
 
-    /// writer가 준비된 만큼 대기 큐에서 계속 꺼내 append한다 — 준비 안 됐으면 큐에 그대로
-    /// 남겨두고 다음 pump(즉시 재시도 또는 requestMediaDataWhenReady 콜백)를 기다린다.
     private func pumpPendingVideo() {
         guard let videoInput = assetWriterVideoInput else { return }
         while videoInput.isReadyForMoreMediaData, !pendingVideoSamples.isEmpty {
@@ -605,7 +596,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         guard let compressionSession else { return }
         let hostTime = CACurrentMediaTime()
 
-        _ = VTCompressionSessionEncodeFrame(
+        VTCompressionSessionEncodeFrameWithOutputHandler(
             compressionSession,
             imageBuffer: pixelBuffer,
             presentationTimeStamp: presentationTime,
