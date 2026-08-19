@@ -11,11 +11,6 @@ import Combine
 ///        ├─ video ──> H.264 압축(VTCompressionSession) ──> 지연 링버퍼 ──(N초 후 drain)──┬──> displayLayer (항상)
 ///        │                                                                              └──> AVAssetWriter video (녹화 중일 때만, passthrough — 재인코딩 없음)
 ///        └─ audio ──> 원본 그대로 ──> 지연 링버퍼 ──(같은 N초 기준 drain)──> AVAssetWriter audio (녹화 중일 때만)
-///
-/// 핵심 불변조건: 녹화 시작/종료는 지연 버퍼의 동작이나 프리뷰 타이밍에 절대 영향을 주지
-/// 않는다 — 녹화는 이미 그려지고 있는 프레임을 "추가로 한 번 더" 파일에 흘려보내는
-/// 수동적인 탭(tap)일 뿐이다. 녹화되는 "내용"은 실시간이 아니라 화면에 보이는 것과
-/// 100% 동일한 지연된 스트림이다.
 final class CameraManager: NSObject, ObservableObject {
 
     // MARK: Published UI state
@@ -27,7 +22,6 @@ final class CameraManager: NSObject, ObservableObject {
     @Published private(set) var recordingStartDate: Date?
     @Published var errorMessage: String?
 
-    /// 지연 프리뷰를 그리는 레이어. 항상 살아있고, 녹화 여부와 무관하게 계속 업데이트된다.
     let displayLayer = AVSampleBufferDisplayLayer()
 
     // MARK: Capture session
@@ -45,7 +39,13 @@ final class CameraManager: NSObject, ObservableObject {
     private var discoveredFrameWidth: Int32?
     private var discoveredFrameHeight: Int32?
 
-    // MARK: Delay buffer — 비디오(압축) / 오디오(원본) 두 개를 같은 시간 기준으로 각각 버퍼링한다
+    /// 첫 오디오 샘플에서 알아낸 실제 포맷. 오디오 writer input을 만들 때 이 값을
+    /// `sourceFormatHint`로 넘겨서, writer가 나중에 들어오는 버퍼를 보고 포맷을
+    /// 추론하는 대신 처음부터 정확한 포맷을 알고 시작하게 한다.
+    private var discoveredAudioFormatDescription: CMFormatDescription?
+    private let audioFormatLock = NSLock()
+
+    // MARK: Delay buffer
 
     private struct BufferedVideoFrame {
         let sampleBuffer: CMSampleBuffer
@@ -75,6 +75,10 @@ final class CameraManager: NSObject, ObservableObject {
     private var recordingStartPTS: CMTime?
     private var writerSessionStarted = false
     private var recordingActive = false
+
+    /// 진단용 카운터 — 콘솔에서 실제로 오디오가 얼마나 기록/드롭됐는지 확인하기 위함.
+    private var debugAudioAppended = 0
+    private var debugAudioDropped = 0
 
     override init() {
         super.init()
@@ -134,7 +138,7 @@ final class CameraManager: NSObject, ObservableObject {
     private func configureAudioSession() {
         let audioSession = AVAudioSession.sharedInstance()
         do {
-            try audioSession.setCategory(.playAndRecord, mode: .videoRecording, options: [.defaultToSpeaker, .allowBluetooth])
+            try audioSession.setCategory(.playAndRecord, mode: .videoRecording, options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
         } catch {
             DispatchQueue.main.async {
                 self.errorMessage = "오디오 세션 설정에 실패했습니다: \(error.localizedDescription)"
@@ -198,7 +202,7 @@ final class CameraManager: NSObject, ObservableObject {
             device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: Int32(fps))
             device.unlockForConfiguration()
         } catch {
-            // 실패해도 기본 포맷 유지
+            // 실패해도 세션의 기본 포맷으로 계속 동작한다.
         }
     }
 
@@ -278,6 +282,10 @@ final class CameraManager: NSObject, ObservableObject {
             self.discoveredFrameWidth = nil
             self.discoveredFrameHeight = nil
         }
+
+        audioFormatLock.lock()
+        discoveredAudioFormatDescription = nil
+        audioFormatLock.unlock()
 
         videoDelayBufferLock.lock()
         videoDelayBuffer.removeAll()
@@ -406,21 +414,14 @@ final class CameraManager: NSObject, ObservableObject {
                 return
             }
 
-            let audioSettings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVNumberOfChannelsKey: 1,
-                AVSampleRateKey: 48_000,
-                AVEncoderBitRateKey: 96_000
-            ]
-            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-            audioInput.expectsMediaDataInRealTime = true
-
             self.assetWriter = writer
             self.assetWriterVideoInput = nil
-            self.assetWriterAudioInput = audioInput
+            self.assetWriterAudioInput = nil
             self.writerSessionStarted = false
             self.recordingStartPTS = nil
             self.recordingActive = true
+            self.debugAudioAppended = 0
+            self.debugAudioDropped = 0
 
             DispatchQueue.main.async {
                 self.isRecording = true
@@ -449,8 +450,12 @@ final class CameraManager: NSObject, ObservableObject {
             self.assetWriterVideoInput?.markAsFinished()
             self.assetWriterAudioInput?.markAsFinished()
 
+            let appended = self.debugAudioAppended
+            let dropped = self.debugAudioDropped
+
             writer.finishWriting { [weak self] in
                 guard let self else { return }
+                print("[DelayCamera] 녹화 종료 — 오디오 프레임 기록: \(appended), 드롭: \(dropped), writer.status: \(writer.status.rawValue), error: \(writer.error?.localizedDescription ?? "없음")")
                 DispatchQueue.main.async {
                     self.isRecording = false
                     self.recordingStartDate = nil
@@ -476,10 +481,27 @@ final class CameraManager: NSObject, ObservableObject {
             videoInput.transform = .identity
             guard writer.canAdd(videoInput) else { return }
             writer.add(videoInput)
-            if let audioInput = assetWriterAudioInput, writer.canAdd(audioInput) {
-                writer.add(audioInput)
-            }
             assetWriterVideoInput = videoInput
+
+            let audioSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVNumberOfChannelsKey: 1,
+                AVSampleRateKey: 48_000,
+                AVEncoderBitRateKey: 96_000
+            ]
+            audioFormatLock.lock()
+            let audioFormatHint = discoveredAudioFormatDescription
+            audioFormatLock.unlock()
+
+            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings, sourceFormatHint: audioFormatHint)
+            audioInput.expectsMediaDataInRealTime = true
+            if writer.canAdd(audioInput) {
+                writer.add(audioInput)
+                assetWriterAudioInput = audioInput
+            } else {
+                print("[DelayCamera] 오디오 input을 writer에 추가하지 못함 (canAdd == false)")
+                DispatchQueue.main.async { self.errorMessage = "오디오 트랙을 녹화에 추가하지 못했습니다." }
+            }
 
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
             writer.startWriting()
@@ -497,8 +519,12 @@ final class CameraManager: NSObject, ObservableObject {
     private func appendDelayedAudioIfRecording(_ sampleBuffer: CMSampleBuffer) {
         guard recordingActive, writerSessionStarted, let start = recordingStartPTS else { return }
         guard CMSampleBufferGetPresentationTimeStamp(sampleBuffer) >= start else { return }
-        if assetWriterAudioInput?.isReadyForMoreMediaData == true {
-            assetWriterAudioInput?.append(sampleBuffer)
+        guard let audioInput = assetWriterAudioInput else { return }
+
+        if audioInput.isReadyForMoreMediaData, audioInput.append(sampleBuffer) {
+            debugAudioAppended += 1
+        } else {
+            debugAudioDropped += 1
         }
     }
 
@@ -535,6 +561,13 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
             encodeForDelayBuffer(pixelBuffer: pixelBuffer, presentationTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
         } else {
             let hostTime = CACurrentMediaTime()
+
+            audioFormatLock.lock()
+            if discoveredAudioFormatDescription == nil {
+                discoveredAudioFormatDescription = CMSampleBufferGetFormatDescription(sampleBuffer)
+            }
+            audioFormatLock.unlock()
+
             audioDelayBufferLock.lock()
             audioDelayBuffer.append(BufferedAudioFrame(sampleBuffer: sampleBuffer, captureHostTime: hostTime))
             audioDelayBufferLock.unlock()
