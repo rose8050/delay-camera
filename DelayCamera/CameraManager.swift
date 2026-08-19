@@ -11,18 +11,23 @@ import Combine
 ///        ├─ video ──> H.264 압축(VTCompressionSession) ──> 지연 링버퍼 ──(N초 후 drain)──┬──> displayLayer (항상)
 ///        │                                                                              └──> AVAssetWriter video (녹화 중일 때만, passthrough — 재인코딩 없음)
 ///        └─ audio ──> 원본 그대로 ──> 지연 링버퍼 ──(같은 N초 기준 drain)──> AVAssetWriter audio (녹화 중일 때만)
+///
+/// 핵심 불변조건: 녹화 시작/종료는 지연 버퍼의 동작이나 프리뷰 타이밍에 절대 영향을 주지
+/// 않는다 — 녹화는 이미 그려지고 있는 프레임을 "추가로 한 번 더" 파일에 흘려보내는
+/// 수동적인 탭(tap)일 뿐이다. 녹화되는 "내용"은 실시간이 아니라 화면에 보이는 것과
+/// 100% 동일한 지연된 스트림이다.
 final class CameraManager: NSObject, ObservableObject {
 
     // MARK: Published UI state
 
     static let delayPresets: [Double] = [15, 20, 30, 40]
 
-    /// 앱 실행 시 기본 지연 시간은 30초.
     @Published private(set) var delaySeconds: Double = 30
     @Published var isRecording = false
     @Published private(set) var recordingStartDate: Date?
     @Published var errorMessage: String?
 
+    /// 지연 프리뷰를 그리는 레이어. 항상 살아있고, 녹화 여부와 무관하게 계속 업데이트된다.
     let displayLayer = AVSampleBufferDisplayLayer()
 
     // MARK: Capture session
@@ -40,7 +45,7 @@ final class CameraManager: NSObject, ObservableObject {
     private var discoveredFrameWidth: Int32?
     private var discoveredFrameHeight: Int32?
 
-    // MARK: Delay buffer
+    // MARK: Delay buffer — 비디오(압축) / 오디오(원본) 두 개를 같은 시간 기준으로 각각 버퍼링한다
 
     private struct BufferedVideoFrame {
         let sampleBuffer: CMSampleBuffer
@@ -58,9 +63,10 @@ final class CameraManager: NSObject, ObservableObject {
     private let audioDelayBufferLock = NSLock()
 
     private var displayLink: CADisplayLink?
+
     private var compressionSession: VTCompressionSession?
 
-    // MARK: Recording
+    // MARK: Recording — recordingQueue 에서만 접근
 
     private let recordingQueue = DispatchQueue(label: "camera.recording.queue")
     private var assetWriter: AVAssetWriter?
@@ -86,6 +92,8 @@ final class CameraManager: NSObject, ObservableObject {
     // MARK: - Setup
 
     func configureSession() {
+        configureAudioSession()
+
         session.beginConfiguration()
         session.sessionPreset = .hd1280x720
 
@@ -122,6 +130,21 @@ final class CameraManager: NSObject, ObservableObject {
         session.commitConfiguration()
     }
 
+    /// 아주 작은 소리까지 담기 위해 `.measurement` 모드로 설정한다 — 이 모드는 iOS가
+    /// 통화/보이스챗용으로 기본 적용하는 AGC(자동 게인 보정)와 노이즈 억제 체인을 끄고,
+    /// 마이크가 실제로 수음한 신호를 가공 없이 가깝게 전달한다.
+    private func configureAudioSession() {
+        let audioSession = AVAudioSession.sharedInstance()
+        do {
+            try audioSession.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .allowBluetooth])
+            try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+        } catch {
+            DispatchQueue.main.async {
+                self.errorMessage = "오디오 세션 설정에 실패했습니다: \(error.localizedDescription)"
+            }
+        }
+    }
+
     private func applyHighFrameRateFormat(to device: AVCaptureDevice) {
         let candidates = device.formats.filter { format in
             let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
@@ -139,6 +162,7 @@ final class CameraManager: NSObject, ObservableObject {
             device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: Int32(fps))
             device.unlockForConfiguration()
         } catch {
+            // 실패해도 세션의 기본 포맷으로 계속 동작한다.
         }
     }
 
@@ -197,12 +221,71 @@ final class CameraManager: NSObject, ObservableObject {
         stopDisplayLink()
     }
 
+    // MARK: - 백그라운드 ↔ 포그라운드 전환 (ContentView가 scenePhase 변화에 맞춰 호출한다)
+
+    /// 백그라운드로 갈 때: 세션/디스플레이링크를 멈추고, 인코더와 두 지연 버퍼를 완전히
+    /// 비운다. 복귀 후에는 항상 "빈 버퍼에서 다시 delaySeconds만큼 채워지길 기다리는"
+    /// 깨끗한 상태로 시작하므로, 오래된(백그라운드 동안 갱신되지 않은) 프레임이 한꺼번에
+    /// 쏟아지거나 디코더가 이상한 상태로 남는 경우를 원천 차단한다.
+    func handleWillResignActive() {
+        if isRecording {
+            stopRecording() // 세션을 끊을 거라 진행 중이던 녹화는 여기까지로 안전하게 마무리한다
+        }
+
+        stopDisplayLink()
+
+        captureQueue.async { [weak self] in
+            guard let self else { return }
+            if self.session.isRunning {
+                self.session.stopRunning()
+            }
+            if let compressionSession = self.compressionSession {
+                VTCompressionSessionInvalidate(compressionSession)
+            }
+            self.compressionSession = nil
+            self.discoveredFrameWidth = nil
+            self.discoveredFrameHeight = nil
+        }
+
+        videoDelayBufferLock.lock()
+        videoDelayBuffer.removeAll()
+        videoDelayBufferLock.unlock()
+
+        audioDelayBufferLock.lock()
+        audioDelayBuffer.removeAll()
+        audioDelayBufferLock.unlock()
+    }
+
+    /// 포그라운드로 돌아올 때: 디스플레이 레이어가 실패 상태면 복구하고, 캡처 세션을
+    /// 다시 돌리고, 디스플레이링크를 재가동한다. 인코더는 버려뒀으므로(위 함수) 다음
+    /// 프레임이 도착하면 captureOutput의 기존 지연 생성 로직이 알아서 새로 만든다.
+    func handleDidBecomeActive() {
+        recoverDisplayLayerIfNeeded()
+
+        captureQueue.async { [weak self] in
+            guard let self, !self.session.isRunning else { return }
+            self.session.startRunning()
+        }
+        startDisplayLink()
+    }
+
+    /// Apple이 문서화한 유일한 공식 복구 방법: `.failed` 상태에서는 새 샘플을 enqueue해도
+    /// 무시되므로, flushAndRemoveImage()로 실패 상태를 지워야 다시 그릴 수 있다. 레이어
+    /// 객체 자체를 새로 만들 필요는 없다.
+    private func recoverDisplayLayerIfNeeded() {
+        if displayLayer.status == .failed {
+            displayLayer.flushAndRemoveImage()
+        }
+    }
+
+    // MARK: - 지연 시간 제어
+
     func setDelay(_ seconds: Double) {
         guard Self.delayPresets.contains(seconds) else { return }
         delaySeconds = seconds
     }
 
-    // MARK: - Delay buffer drain
+    // MARK: - Delay buffer → delayed preview (+ 녹화 중이면 같은 프레임을 recording에도 전달)
 
     private func startDisplayLink() {
         let link = CADisplayLink(target: self, selector: #selector(handleDisplayLink))
@@ -220,6 +303,8 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     private func drainDelayBufferIfReady() {
+        recoverDisplayLayerIfNeeded()
+
         let now = CACurrentMediaTime()
         let delay = delaySeconds
 
@@ -362,6 +447,9 @@ final class CameraManager: NSObject, ObservableObject {
 
             let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: formatDescription)
             videoInput.expectsMediaDataInRealTime = true
+            // 압축 스트림이 이미 실측 세로 크기로 인코딩되어 있으므로 추가 회전이
+            // 필요 없다 — 여기서 회전 transform을 걸면 오히려 다시 돌아가 버린다.
+            videoInput.transform = .identity
             guard writer.canAdd(videoInput) else { return }
             writer.add(videoInput)
             if let audioInput = assetWriterAudioInput, writer.canAdd(audioInput) {
@@ -408,8 +496,6 @@ final class CameraManager: NSObject, ObservableObject {
     }
 }
 
-// MARK: - Capture Delegate
-
 extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
@@ -435,7 +521,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         guard let compressionSession else { return }
         let hostTime = CACurrentMediaTime()
 
-        _ = VTCompressionSessionEncodeFrame(
+        VTCompressionSessionEncodeFrameWithOutputHandler(
             compressionSession,
             imageBuffer: pixelBuffer,
             presentationTimeStamp: presentationTime,
