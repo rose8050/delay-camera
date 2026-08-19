@@ -7,13 +7,12 @@ import Combine
 
 final class CameraManager: NSObject, ObservableObject {
 
-    static let delayPresets: [Double] = [3, 5, 8, 10, 15]
+    static let delayPresets: [Double] = [15, 20, 30, 40]
 
-    @Published private(set) var delaySeconds: Double = CameraManager.delayPresets[1]
+    @Published private(set) var delaySeconds: Double = CameraManager.delayPresets[0]
     @Published var isRecording = false
     @Published private(set) var recordingStartDate: Date?
     @Published var errorMessage: String?
-    @Published private(set) var cameraPosition: AVCaptureDevice.Position = .back
 
     let displayLayer = AVSampleBufferDisplayLayer()
 
@@ -23,9 +22,14 @@ final class CameraManager: NSObject, ObservableObject {
 
     private let captureQueue = DispatchQueue(label: "camera.capture.queue")
 
-    private static let targetWidth: Int32 = 1280
-    private static let targetHeight: Int32 = 720
+    private static let sensorWidth: Int32 = 1280
+    private static let sensorHeight: Int32 = 720
+    private static let outputWidth: Int32 = 720
+    private static let outputHeight: Int32 = 1280
     private static let targetFPS: Double = 60
+
+    private var discoveredFrameWidth: Int32?
+    private var discoveredFrameHeight: Int32?
 
     private struct BufferedFrame {
         let sampleBuffer: CMSampleBuffer
@@ -48,6 +52,7 @@ final class CameraManager: NSObject, ObservableObject {
     override init() {
         super.init()
         displayLayer.videoGravity = .resizeAspectFill
+        displayLayer.transform = CATransform3DIdentity
     }
 
     deinit {
@@ -61,7 +66,7 @@ final class CameraManager: NSObject, ObservableObject {
         session.beginConfiguration()
         session.sessionPreset = .hd1280x720
 
-        guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: cameraPosition),
+        guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let videoInput = try? AVCaptureDeviceInput(device: camera),
               session.canAddInput(videoInput) else {
             session.commitConfiguration()
@@ -92,13 +97,12 @@ final class CameraManager: NSObject, ObservableObject {
         }
 
         session.commitConfiguration()
-        setupCompressionSession()
     }
 
     private func applyHighFrameRateFormat(to device: AVCaptureDevice) {
         let candidates = device.formats.filter { format in
             let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-            return dims.width == Self.targetWidth && dims.height == Self.targetHeight
+            return dims.width == Self.sensorWidth && dims.height == Self.sensorHeight
         }
         guard let format = candidates.first(where: { $0.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= Self.targetFPS } })
             ?? candidates.first else { return }
@@ -117,20 +121,19 @@ final class CameraManager: NSObject, ObservableObject {
 
     private func configureVideoConnection() {
         guard let connection = videoDataOutput.connection(with: .video) else { return }
-        if connection.isVideoOrientationSupported {
-            connection.videoOrientation = .portrait
+        guard connection.isVideoOrientationSupported else {
+            DispatchQueue.main.async { self.errorMessage = "이 기기에서는 세로 방향 고정을 지원하지 않습니다." }
+            return
         }
-        if connection.isVideoMirroringSupported {
-            connection.isVideoMirrored = (cameraPosition == .front)
-        }
+        connection.videoOrientation = .portrait
     }
 
-    private func setupCompressionSession() {
+    private func setupCompressionSession(width: Int32, height: Int32) {
         var newSession: VTCompressionSession?
         let status = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault,
-            width: Self.targetWidth,
-            height: Self.targetHeight,
+            width: width,
+            height: height,
             codecType: kCMVideoCodecType_H264,
             encoderSpecification: nil,
             imageBufferAttributes: nil,
@@ -146,9 +149,9 @@ final class CameraManager: NSObject, ObservableObject {
         }
 
         VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-        VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Main_AutoLevel)
+        VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
         VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-        VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_AverageBitRate, value: 5_000_000 as CFTypeRef)
+        VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_AverageBitRate, value: 12_000_000 as CFTypeRef)
         VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: Self.targetFPS as CFTypeRef)
         VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: Int(Self.targetFPS) as CFTypeRef)
         VTCompressionSessionPrepareToEncodeFrames(compressionSession)
@@ -171,41 +174,9 @@ final class CameraManager: NSObject, ObservableObject {
         stopDisplayLink()
     }
 
-    func switchCamera() {
-        captureQueue.async { [weak self] in
-            guard let self else { return }
-            let newPosition: AVCaptureDevice.Position = self.cameraPosition == .back ? .front : .back
-
-            guard let newDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: newPosition),
-                  let newInput = try? AVCaptureDeviceInput(device: newDevice) else { return }
-
-            self.session.beginConfiguration()
-            defer { self.session.commitConfiguration() }
-
-            guard let currentInput = self.session.inputs
-                .compactMap({ $0 as? AVCaptureDeviceInput })
-                .first(where: { $0.device.hasMediaType(.video) }) else { return }
-
-            self.session.removeInput(currentInput)
-            guard self.session.canAddInput(newInput) else {
-                self.session.addInput(currentInput)
-                return
-            }
-            self.session.addInput(newInput)
-            self.applyHighFrameRateFormat(to: newDevice)
-            self.configureVideoConnection()
-
-            DispatchQueue.main.async { self.cameraPosition = newPosition }
-        }
-    }
-
-    func stepDelay(forward: Bool) {
-        guard let index = Self.delayPresets.firstIndex(of: delaySeconds) else {
-            delaySeconds = forward ? Self.delayPresets.last! : Self.delayPresets.first!
-            return
-        }
-        let newIndex = forward ? min(index + 1, Self.delayPresets.count - 1) : max(index - 1, 0)
-        delaySeconds = Self.delayPresets[newIndex]
+    func setDelay(_ seconds: Double) {
+        guard Self.delayPresets.contains(seconds) else { return }
+        delaySeconds = seconds
     }
 
     private func startDisplayLink() {
@@ -272,10 +243,13 @@ final class CameraManager: NSObject, ObservableObject {
                 return
             }
 
+            let width = self.discoveredFrameWidth ?? Self.outputWidth
+            let height = self.discoveredFrameHeight ?? Self.outputHeight
+
             let videoSettings: [String: Any] = [
                 AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: Self.targetWidth,
-                AVVideoHeightKey: Self.targetHeight,
+                AVVideoWidthKey: width,
+                AVVideoHeightKey: height,
                 AVVideoCompressionPropertiesKey: [
                     AVVideoAverageBitRateKey: 8_000_000,
                     AVVideoExpectedSourceFrameRateKey: Int(Self.targetFPS)
@@ -358,6 +332,13 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         let isVideo = (output === videoDataOutput)
 
         if isVideo, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+            if compressionSession == nil {
+                let width = Int32(CVPixelBufferGetWidth(pixelBuffer))
+                let height = Int32(CVPixelBufferGetHeight(pixelBuffer))
+                discoveredFrameWidth = width
+                discoveredFrameHeight = height
+                setupCompressionSession(width: width, height: height)
+            }
             encodeForDelayBuffer(pixelBuffer: pixelBuffer, presentationTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
         }
 
