@@ -5,16 +5,27 @@ import QuartzCore
 import Photos
 import Combine
 
+/// 카메라의 실시간 입력을 받아 처리한다.
+///
+///   Camera input (후면 카메라 고정, portrait, 720x1280 @ 60fps)
+///        ├─ video ──> H.264 압축(VTCompressionSession) ──> 지연 링버퍼 ──(N초 후 drain)──┬──> displayLayer (항상)
+///        │                                                                              └──> AVAssetWriter video (녹화 중일 때만, passthrough — 재인코딩 없음)
+///        └─ audio ──> 원본 그대로 ──> 지연 링버퍼 ──(같은 N초 기준 drain)──> AVAssetWriter audio (녹화 중일 때만)
 final class CameraManager: NSObject, ObservableObject {
+
+    // MARK: Published UI state
 
     static let delayPresets: [Double] = [15, 20, 30, 40]
 
-    @Published private(set) var delaySeconds: Double = CameraManager.delayPresets[0]
+    /// 앱 실행 시 기본 지연 시간은 30초.
+    @Published private(set) var delaySeconds: Double = 30
     @Published var isRecording = false
     @Published private(set) var recordingStartDate: Date?
     @Published var errorMessage: String?
 
     let displayLayer = AVSampleBufferDisplayLayer()
+
+    // MARK: Capture session
 
     private let session = AVCaptureSession()
     private let videoDataOutput = AVCaptureVideoDataOutput()
@@ -24,22 +35,32 @@ final class CameraManager: NSObject, ObservableObject {
 
     private static let sensorWidth: Int32 = 1280
     private static let sensorHeight: Int32 = 720
-    private static let outputWidth: Int32 = 720
-    private static let outputHeight: Int32 = 1280
     private static let targetFPS: Double = 60
 
     private var discoveredFrameWidth: Int32?
     private var discoveredFrameHeight: Int32?
 
-    private struct BufferedFrame {
+    // MARK: Delay buffer
+
+    private struct BufferedVideoFrame {
+        let sampleBuffer: CMSampleBuffer
+        let captureHostTime: Double
+    }
+    private struct BufferedAudioFrame {
         let sampleBuffer: CMSampleBuffer
         let captureHostTime: Double
     }
 
-    private var videoDelayBuffer: [BufferedFrame] = []
-    private let delayBufferLock = NSLock()
+    private var videoDelayBuffer: [BufferedVideoFrame] = []
+    private let videoDelayBufferLock = NSLock()
+
+    private var audioDelayBuffer: [BufferedAudioFrame] = []
+    private let audioDelayBufferLock = NSLock()
+
     private var displayLink: CADisplayLink?
     private var compressionSession: VTCompressionSession?
+
+    // MARK: Recording
 
     private let recordingQueue = DispatchQueue(label: "camera.recording.queue")
     private var assetWriter: AVAssetWriter?
@@ -61,6 +82,8 @@ final class CameraManager: NSObject, ObservableObject {
             VTCompressionSessionInvalidate(compressionSession)
         }
     }
+
+    // MARK: - Setup
 
     func configureSession() {
         session.beginConfiguration()
@@ -179,6 +202,8 @@ final class CameraManager: NSObject, ObservableObject {
         delaySeconds = seconds
     }
 
+    // MARK: - Delay buffer drain
+
     private func startDisplayLink() {
         let link = CADisplayLink(target: self, selector: #selector(handleDisplayLink))
         link.add(to: .main, forMode: .common)
@@ -198,24 +223,40 @@ final class CameraManager: NSObject, ObservableObject {
         let now = CACurrentMediaTime()
         let delay = delaySeconds
 
-        delayBufferLock.lock()
-        var dueCount = 0
+        videoDelayBufferLock.lock()
+        var videoDueCount = 0
         for frame in videoDelayBuffer {
             guard now - frame.captureHostTime >= delay else { break }
-            dueCount += 1
+            videoDueCount += 1
         }
-        guard dueCount > 0 else {
-            delayBufferLock.unlock()
-            return
-        }
-        let dueFrames = Array(videoDelayBuffer[0..<dueCount])
-        videoDelayBuffer.removeFirst(dueCount)
-        delayBufferLock.unlock()
+        let dueVideoFrames = videoDueCount > 0 ? Array(videoDelayBuffer[0..<videoDueCount]) : []
+        if videoDueCount > 0 { videoDelayBuffer.removeFirst(videoDueCount) }
+        videoDelayBufferLock.unlock()
 
-        for frame in dueFrames {
-            guard displayLayer.isReadyForMoreMediaData else { break }
-            markForImmediateDisplay(frame.sampleBuffer)
-            displayLayer.enqueue(frame.sampleBuffer)
+        for frame in dueVideoFrames {
+            recordingQueue.async { [weak self] in
+                self?.appendDelayedVideoIfRecording(frame.sampleBuffer)
+            }
+            if displayLayer.isReadyForMoreMediaData {
+                markForImmediateDisplay(frame.sampleBuffer)
+                displayLayer.enqueue(frame.sampleBuffer)
+            }
+        }
+
+        audioDelayBufferLock.lock()
+        var audioDueCount = 0
+        for frame in audioDelayBuffer {
+            guard now - frame.captureHostTime >= delay else { break }
+            audioDueCount += 1
+        }
+        let dueAudioFrames = audioDueCount > 0 ? Array(audioDelayBuffer[0..<audioDueCount]) : []
+        if audioDueCount > 0 { audioDelayBuffer.removeFirst(audioDueCount) }
+        audioDelayBufferLock.unlock()
+
+        for frame in dueAudioFrames {
+            recordingQueue.async { [weak self] in
+                self?.appendDelayedAudioIfRecording(frame.sampleBuffer)
+            }
         }
     }
 
@@ -230,6 +271,17 @@ final class CameraManager: NSObject, ObservableObject {
         )
     }
 
+    private func isKeyframe(_ sampleBuffer: CMSampleBuffer) -> Bool {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]],
+              let first = attachments.first else {
+            return true
+        }
+        let notSync = first[kCMSampleAttachmentKey_NotSync] as? Bool ?? false
+        return !notSync
+    }
+
+    // MARK: - Recording control
+
     func startRecording() {
         recordingQueue.async { [weak self] in
             guard let self, !self.recordingActive else { return }
@@ -243,21 +295,6 @@ final class CameraManager: NSObject, ObservableObject {
                 return
             }
 
-            let width = self.discoveredFrameWidth ?? Self.outputWidth
-            let height = self.discoveredFrameHeight ?? Self.outputHeight
-
-            let videoSettings: [String: Any] = [
-                AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: width,
-                AVVideoHeightKey: height,
-                AVVideoCompressionPropertiesKey: [
-                    AVVideoAverageBitRateKey: 8_000_000,
-                    AVVideoExpectedSourceFrameRateKey: Int(Self.targetFPS)
-                ]
-            ]
-            let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-            videoInput.expectsMediaDataInRealTime = true
-
             let audioSettings: [String: Any] = [
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
                 AVNumberOfChannelsKey: 1,
@@ -267,11 +304,8 @@ final class CameraManager: NSObject, ObservableObject {
             let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
             audioInput.expectsMediaDataInRealTime = true
 
-            if writer.canAdd(videoInput) { writer.add(videoInput) }
-            if writer.canAdd(audioInput) { writer.add(audioInput) }
-
             self.assetWriter = writer
-            self.assetWriterVideoInput = videoInput
+            self.assetWriterVideoInput = nil
             self.assetWriterAudioInput = audioInput
             self.writerSessionStarted = false
             self.recordingStartPTS = nil
@@ -289,22 +323,70 @@ final class CameraManager: NSObject, ObservableObject {
             guard let self, self.recordingActive else { return }
             self.recordingActive = false
 
-            let writer = self.assetWriter
+            guard self.writerSessionStarted, let writer = self.assetWriter else {
+                self.assetWriter = nil
+                self.assetWriterVideoInput = nil
+                self.assetWriterAudioInput = nil
+                DispatchQueue.main.async {
+                    self.isRecording = false
+                    self.recordingStartDate = nil
+                    self.errorMessage = "녹화 시간이 너무 짧아 저장할 프레임이 없습니다."
+                }
+                return
+            }
+
             self.assetWriterVideoInput?.markAsFinished()
             self.assetWriterAudioInput?.markAsFinished()
 
-            writer?.finishWriting { [weak self] in
+            writer.finishWriting { [weak self] in
                 guard let self else { return }
                 DispatchQueue.main.async {
                     self.isRecording = false
                     self.recordingStartDate = nil
                 }
-                if writer?.status == .completed, let url = writer?.outputURL {
-                    self.saveToPhotoLibrary(url: url)
-                } else if let error = writer?.error {
+                if writer.status == .completed {
+                    self.saveToPhotoLibrary(url: writer.outputURL)
+                } else if let error = writer.error {
                     DispatchQueue.main.async { self.errorMessage = error.localizedDescription }
                 }
             }
+        }
+    }
+
+    private func appendDelayedVideoIfRecording(_ sampleBuffer: CMSampleBuffer) {
+        guard recordingActive, let writer = assetWriter else { return }
+
+        if !writerSessionStarted {
+            guard isKeyframe(sampleBuffer),
+                  let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
+
+            let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: formatDescription)
+            videoInput.expectsMediaDataInRealTime = true
+            guard writer.canAdd(videoInput) else { return }
+            writer.add(videoInput)
+            if let audioInput = assetWriterAudioInput, writer.canAdd(audioInput) {
+                writer.add(audioInput)
+            }
+            assetWriterVideoInput = videoInput
+
+            let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            writer.startWriting()
+            writer.startSession(atSourceTime: pts)
+            writerSessionStarted = true
+            recordingStartPTS = pts
+        }
+
+        guard let start = recordingStartPTS, CMSampleBufferGetPresentationTimeStamp(sampleBuffer) >= start else { return }
+        if assetWriterVideoInput?.isReadyForMoreMediaData == true {
+            assetWriterVideoInput?.append(sampleBuffer)
+        }
+    }
+
+    private func appendDelayedAudioIfRecording(_ sampleBuffer: CMSampleBuffer) {
+        guard recordingActive, writerSessionStarted, let start = recordingStartPTS else { return }
+        guard CMSampleBufferGetPresentationTimeStamp(sampleBuffer) >= start else { return }
+        if assetWriterAudioInput?.isReadyForMoreMediaData == true {
+            assetWriterAudioInput?.append(sampleBuffer)
         }
     }
 
@@ -326,12 +408,13 @@ final class CameraManager: NSObject, ObservableObject {
     }
 }
 
+// MARK: - Capture Delegate
+
 extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        let isVideo = (output === videoDataOutput)
-
-        if isVideo, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+        if output === videoDataOutput {
+            guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
             if compressionSession == nil {
                 let width = Int32(CVPixelBufferGetWidth(pixelBuffer))
                 let height = Int32(CVPixelBufferGetHeight(pixelBuffer))
@@ -340,10 +423,11 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
                 setupCompressionSession(width: width, height: height)
             }
             encodeForDelayBuffer(pixelBuffer: pixelBuffer, presentationTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
-        }
-
-        recordingQueue.async { [weak self] in
-            self?.appendToWriterIfRecording(sampleBuffer: sampleBuffer, isVideo: isVideo)
+        } else {
+            let hostTime = CACurrentMediaTime()
+            audioDelayBufferLock.lock()
+            audioDelayBuffer.append(BufferedAudioFrame(sampleBuffer: sampleBuffer, captureHostTime: hostTime))
+            audioDelayBufferLock.unlock()
         }
     }
 
@@ -361,35 +445,9 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         ) { [weak self] status, _, encodedBuffer in
             guard let self, status == noErr,
                   let encodedBuffer, CMSampleBufferDataIsReady(encodedBuffer) else { return }
-            self.delayBufferLock.lock()
-            self.videoDelayBuffer.append(BufferedFrame(sampleBuffer: encodedBuffer, captureHostTime: hostTime))
-            self.delayBufferLock.unlock()
-        }
-    }
-
-    private func appendToWriterIfRecording(sampleBuffer: CMSampleBuffer, isVideo: Bool) {
-        guard recordingActive, let writer = assetWriter else { return }
-
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-
-        if !writerSessionStarted {
-            guard isVideo else { return }
-            writer.startWriting()
-            writer.startSession(atSourceTime: pts)
-            writerSessionStarted = true
-            recordingStartPTS = pts
-        }
-
-        guard let start = recordingStartPTS, pts >= start else { return }
-
-        if isVideo {
-            if assetWriterVideoInput?.isReadyForMoreMediaData == true {
-                assetWriterVideoInput?.append(sampleBuffer)
-            }
-        } else {
-            if assetWriterAudioInput?.isReadyForMoreMediaData == true {
-                assetWriterAudioInput?.append(sampleBuffer)
-            }
+            self.videoDelayBufferLock.lock()
+            self.videoDelayBuffer.append(BufferedVideoFrame(sampleBuffer: encodedBuffer, captureHostTime: hostTime))
+            self.videoDelayBufferLock.unlock()
         }
     }
 }
