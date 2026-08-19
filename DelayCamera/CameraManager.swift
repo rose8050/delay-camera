@@ -73,8 +73,11 @@ final class CameraManager: NSObject, ObservableObject {
     private var writerSessionStarted = false
     private var recordingActive = false
 
+    /// writer가 순간적으로 안 준비된 상태여도 샘플을 잃지 않기 위한 대기 큐.
+    /// requestMediaDataWhenReady 콜백과 append 직후 모두 recordingQueue에서만 건드린다.
     private var pendingVideoSamples: [CMSampleBuffer] = []
     private var pendingAudioSamples: [CMSampleBuffer] = []
+    /// 정말 writer가 멈춰버린 극단적 상황(디스크 오류 등)에 대비한 방어적 상한.
     private static let maxPendingSamples = 500
 
     private var debugAudioAppended = 0
@@ -457,6 +460,7 @@ final class CameraManager: NSObject, ObservableObject {
                 return
             }
 
+            // 남은 대기 큐를 writer가 받아줄 수 있을 때까지 마저 흘려보낸다.
             self.pumpPendingVideo()
             self.pumpPendingAudio()
 
@@ -468,7 +472,7 @@ final class CameraManager: NSObject, ObservableObject {
 
             writer.finishWriting { [weak self] in
                 guard let self else { return }
-                print("[DelayCamera] 녹화 종료 — 오디오 프레임 기록: \(appended), 드롭: \(dropped), writer.status: \(writer.status.rawValue), error: \(writer.error?.localizedDescription ?? "없음")")
+                print("[DelayCamera] 녹화 종료 — 오디오 프레임 기록: \(appended), drop: \(dropped), writer.status: \(writer.status.rawValue), error: \(writer.error?.localizedDescription ?? "없음")")
                 DispatchQueue.main.async {
                     self.isRecording = false
                     self.recordingStartDate = nil
@@ -520,7 +524,6 @@ final class CameraManager: NSObject, ObservableObject {
         pendingVideoSamples.append(sampleBuffer)
         if pendingVideoSamples.count > Self.maxPendingSamples {
             pendingVideoSamples.removeFirst(pendingVideoSamples.count - Self.maxPendingSamples)
-            print("[DelayCamera] 경고: 비디오 대기 큐가 상한을 넘어 오래된 프레임을 버림")
         }
         pumpPendingVideo()
     }
@@ -531,7 +534,6 @@ final class CameraManager: NSObject, ObservableObject {
         pendingAudioSamples.append(sampleBuffer)
         if pendingAudioSamples.count > Self.maxPendingSamples {
             pendingAudioSamples.removeFirst(pendingAudioSamples.count - Self.maxPendingSamples)
-            print("[DelayCamera] 경고: 오디오 대기 큐가 상한을 넘어 오래된 프레임을 버림")
         }
         pumpPendingAudio()
     }
@@ -597,15 +599,13 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         guard let compressionSession else { return }
         let hostTime = CACurrentMediaTime()
 
-        // session을 제외한 나머지 인자는 이 SDK에서 라벨 없이(positional) 임포트된다 —
-        // 라벨을 붙이면 "extraneous argument labels" 컴파일 에러가 난다.
-        VTCompressionSessionEncodeFrameWithOutputHandler(
+        _ = VTCompressionSessionEncodeFrame(
             compressionSession,
-            pixelBuffer,
-            presentationTime,
-            .invalid,
-            nil,
-            nil
+            imageBuffer: pixelBuffer,
+            presentationTimeStamp: presentationTime,
+            duration: .invalid,
+            frameProperties: nil,
+            infoFlagsOut: nil
         ) { [weak self] status, _, encodedBuffer in
             guard let self, status == noErr,
                   let encodedBuffer, CMSampleBufferDataIsReady(encodedBuffer) else { return }
