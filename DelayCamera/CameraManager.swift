@@ -92,11 +92,10 @@ final class CameraManager: NSObject, ObservableObject {
     // MARK: - Setup
 
     func configureSession() {
-        session.beginConfiguration()
-        // 우리가 AVAudioSession을 직접(.measurement 모드로) 설정할 것이므로, AVCaptureSession이
-        // 세션 시작 시점에 자기 마음대로 오디오 세션 카테고리/모드를 다시 덮어쓰지 못하게 막는다.
-        session.automaticallyConfiguresApplicationAudioSession = false
+        configureAudioSession()
 
+        session.beginConfiguration()
+        session.automaticallyConfiguresApplicationAudioSession = true
         session.sessionPreset = .hd1280x720
 
         guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
@@ -109,6 +108,10 @@ final class CameraManager: NSObject, ObservableObject {
         session.addInput(videoInput)
         applyHighFrameRateFormat(to: camera)
         session.sessionPreset = .inputPriority
+
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
+            addAudioInput()
+        }
 
         videoDataOutput.setSampleBufferDelegate(self, queue: captureQueue)
         videoDataOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
@@ -125,17 +128,13 @@ final class CameraManager: NSObject, ObservableObject {
 
         session.commitConfiguration()
 
-        configureAudioSession()
-        configureAudioInputIfAuthorized()
+        handleAudioAuthorizationIfNeeded()
     }
 
-    /// `.measurement` 모드로 iOS의 통화용 AGC(자동 게인 보정)/노이즈 억제 체인을 끄고,
-    /// 마이크가 실제로 수음한 신호를 최대한 가공 없이 전달하게 한다.
     private func configureAudioSession() {
         let audioSession = AVAudioSession.sharedInstance()
         do {
-            try audioSession.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .allowBluetooth])
-            try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+            try audioSession.setCategory(.playAndRecord, mode: .videoRecording, options: [.defaultToSpeaker, .allowBluetooth])
         } catch {
             DispatchQueue.main.async {
                 self.errorMessage = "오디오 세션 설정에 실패했습니다: \(error.localizedDescription)"
@@ -143,21 +142,22 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    /// 마이크 권한을 명시적으로 확인/요청한다.
-    private func configureAudioInputIfAuthorized() {
+    private func handleAudioAuthorizationIfNeeded() {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
-            addAudioInputAndOutput()
+            break
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
                 guard let self else { return }
-                if granted {
-                    self.addAudioInputAndOutput()
-                } else {
+                guard granted else {
                     DispatchQueue.main.async {
                         self.errorMessage = "마이크 접근 권한이 거부되어 오디오가 녹음되지 않습니다."
                     }
+                    return
                 }
+                self.session.beginConfiguration()
+                self.addAudioInput()
+                self.session.commitConfiguration()
             }
         case .denied, .restricted:
             DispatchQueue.main.async {
@@ -168,24 +168,17 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    private func addAudioInputAndOutput() {
-        captureQueue.async { [weak self] in
-            guard let self else { return }
-            guard let mic = AVCaptureDevice.default(for: .audio),
-                  let audioInput = try? AVCaptureDeviceInput(device: mic) else {
-                DispatchQueue.main.async { self.errorMessage = "마이크를 열 수 없습니다." }
-                return
-            }
-
-            self.session.beginConfiguration()
-            defer { self.session.commitConfiguration() }
-
-            guard self.session.canAddInput(audioInput) else {
-                DispatchQueue.main.async { self.errorMessage = "오디오 입력을 세션에 추가할 수 없습니다." }
-                return
-            }
-            self.session.addInput(audioInput)
+    private func addAudioInput() {
+        guard let mic = AVCaptureDevice.default(for: .audio),
+              let audioInput = try? AVCaptureDeviceInput(device: mic) else {
+            DispatchQueue.main.async { self.errorMessage = "마이크를 열 수 없습니다." }
+            return
         }
+        guard session.canAddInput(audioInput) else {
+            DispatchQueue.main.async { self.errorMessage = "오디오 입력을 세션에 추가할 수 없습니다." }
+            return
+        }
+        session.addInput(audioInput)
     }
 
     private func applyHighFrameRateFormat(to device: AVCaptureDevice) {
@@ -205,7 +198,7 @@ final class CameraManager: NSObject, ObservableObject {
             device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: Int32(fps))
             device.unlockForConfiguration()
         } catch {
-            // 포맷 설정 실패 시 기본값 유지
+            // 실패해도 기본 포맷 유지
         }
     }
 
@@ -417,7 +410,7 @@ final class CameraManager: NSObject, ObservableObject {
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
                 AVNumberOfChannelsKey: 1,
                 AVSampleRateKey: 48_000,
-                AVEncoderBitRateKey: 64_000
+                AVEncoderBitRateKey: 96_000
             ]
             let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
             audioInput.expectsMediaDataInRealTime = true
