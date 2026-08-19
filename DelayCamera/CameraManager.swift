@@ -358,6 +358,7 @@ final class CameraManager: NSObject, ObservableObject {
             }
         }
 
+        // 오디오는 비디오보다 훨씬 촘촘하게 들어오므로, 이 틱까지 밀린 것을 전부(개수 제한 없이) 꺼낸다.
         audioDelayBufferLock.lock()
         var audioDueCount = 0
         for frame in audioDelayBuffer {
@@ -596,13 +597,15 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         guard let compressionSession else { return }
         let hostTime = CACurrentMediaTime()
 
+        // session을 제외한 나머지 인자는 이 SDK에서 라벨 없이(positional) 임포트된다 —
+        // 라벨을 붙이면 "extraneous argument labels" 컴파일 에러가 난다.
         VTCompressionSessionEncodeFrameWithOutputHandler(
             compressionSession,
-            imageBuffer: pixelBuffer,
-            presentationTimeStamp: presentationTime,
-            duration: .invalid,
-            frameProperties: nil,
-            infoFlagsOut: nil
+            pixelBuffer,
+            presentationTime,
+            .invalid,
+            nil,
+            nil
         ) { [weak self] status, _, encodedBuffer in
             guard let self, status == noErr,
                   let encodedBuffer, CMSampleBufferDataIsReady(encodedBuffer) else { return }
