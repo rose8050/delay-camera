@@ -92,9 +92,11 @@ final class CameraManager: NSObject, ObservableObject {
     // MARK: - Setup
 
     func configureSession() {
-        configureAudioSession()
-
         session.beginConfiguration()
+        // 우리가 AVAudioSession을 직접(.measurement 모드로) 설정할 것이므로, AVCaptureSession이
+        // 세션 시작 시점에 자기 마음대로 오디오 세션 카테고리/모드를 다시 덮어쓰지 못하게 막는다.
+        session.automaticallyConfiguresApplicationAudioSession = false
+
         session.sessionPreset = .hd1280x720
 
         guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
@@ -107,12 +109,6 @@ final class CameraManager: NSObject, ObservableObject {
         session.addInput(videoInput)
         applyHighFrameRateFormat(to: camera)
         session.sessionPreset = .inputPriority
-
-        if let mic = AVCaptureDevice.default(for: .audio),
-           let audioInput = try? AVCaptureDeviceInput(device: mic),
-           session.canAddInput(audioInput) {
-            session.addInput(audioInput)
-        }
 
         videoDataOutput.setSampleBufferDelegate(self, queue: captureQueue)
         videoDataOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
@@ -128,11 +124,13 @@ final class CameraManager: NSObject, ObservableObject {
         }
 
         session.commitConfiguration()
+
+        configureAudioSession()
+        configureAudioInputIfAuthorized()
     }
 
-    /// 아주 작은 소리까지 담기 위해 `.measurement` 모드로 설정한다 — 이 모드는 iOS가
-    /// 통화/보이스챗용으로 기본 적용하는 AGC(자동 게인 보정)와 노이즈 억제 체인을 끄고,
-    /// 마이크가 실제로 수음한 신호를 가공 없이 가깝게 전달한다.
+    /// `.measurement` 모드로 iOS의 통화용 AGC(자동 게인 보정)/노이즈 억제 체인을 끄고,
+    /// 마이크가 실제로 수음한 신호를 최대한 가공 없이 전달하게 한다.
     private func configureAudioSession() {
         let audioSession = AVAudioSession.sharedInstance()
         do {
@@ -142,6 +140,51 @@ final class CameraManager: NSObject, ObservableObject {
             DispatchQueue.main.async {
                 self.errorMessage = "오디오 세션 설정에 실패했습니다: \(error.localizedDescription)"
             }
+        }
+    }
+
+    /// 마이크 권한을 명시적으로 확인/요청한다.
+    private func configureAudioInputIfAuthorized() {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            addAudioInputAndOutput()
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                guard let self else { return }
+                if granted {
+                    self.addAudioInputAndOutput()
+                } else {
+                    DispatchQueue.main.async {
+                        self.errorMessage = "마이크 접근 권한이 거부되어 오디오가 녹음되지 않습니다."
+                    }
+                }
+            }
+        case .denied, .restricted:
+            DispatchQueue.main.async {
+                self.errorMessage = "마이크 접근 권한이 거부되어 오디오가 녹음되지 않습니다. 설정 앱에서 권한을 허용해주세요."
+            }
+        @unknown default:
+            break
+        }
+    }
+
+    private func addAudioInputAndOutput() {
+        captureQueue.async { [weak self] in
+            guard let self else { return }
+            guard let mic = AVCaptureDevice.default(for: .audio),
+                  let audioInput = try? AVCaptureDeviceInput(device: mic) else {
+                DispatchQueue.main.async { self.errorMessage = "마이크를 열 수 없습니다." }
+                return
+            }
+
+            self.session.beginConfiguration()
+            defer { self.session.commitConfiguration() }
+
+            guard self.session.canAddInput(audioInput) else {
+                DispatchQueue.main.async { self.errorMessage = "오디오 입력을 세션에 추가할 수 없습니다." }
+                return
+            }
+            self.session.addInput(audioInput)
         }
     }
 
@@ -162,7 +205,7 @@ final class CameraManager: NSObject, ObservableObject {
             device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: Int32(fps))
             device.unlockForConfiguration()
         } catch {
-            // 실패해도 세션의 기본 포맷으로 계속 동작한다.
+            // 포맷 설정 실패 시 기본값 유지
         }
     }
 
@@ -221,15 +264,11 @@ final class CameraManager: NSObject, ObservableObject {
         stopDisplayLink()
     }
 
-    // MARK: - 백그라운드 ↔ 포그라운드 전환 (ContentView가 scenePhase 변화에 맞춰 호출한다)
+    // MARK: - 백그라운드 ↔ 포그라운드 전환
 
-    /// 백그라운드로 갈 때: 세션/디스플레이링크를 멈추고, 인코더와 두 지연 버퍼를 완전히
-    /// 비운다. 복귀 후에는 항상 "빈 버퍼에서 다시 delaySeconds만큼 채워지길 기다리는"
-    /// 깨끗한 상태로 시작하므로, 오래된(백그라운드 동안 갱신되지 않은) 프레임이 한꺼번에
-    /// 쏟아지거나 디코더가 이상한 상태로 남는 경우를 원천 차단한다.
     func handleWillResignActive() {
         if isRecording {
-            stopRecording() // 세션을 끊을 거라 진행 중이던 녹화는 여기까지로 안전하게 마무리한다
+            stopRecording()
         }
 
         stopDisplayLink()
@@ -256,9 +295,6 @@ final class CameraManager: NSObject, ObservableObject {
         audioDelayBufferLock.unlock()
     }
 
-    /// 포그라운드로 돌아올 때: 디스플레이 레이어가 실패 상태면 복구하고, 캡처 세션을
-    /// 다시 돌리고, 디스플레이링크를 재가동한다. 인코더는 버려뒀으므로(위 함수) 다음
-    /// 프레임이 도착하면 captureOutput의 기존 지연 생성 로직이 알아서 새로 만든다.
     func handleDidBecomeActive() {
         recoverDisplayLayerIfNeeded()
 
@@ -269,9 +305,6 @@ final class CameraManager: NSObject, ObservableObject {
         startDisplayLink()
     }
 
-    /// Apple이 문서화한 유일한 공식 복구 방법: `.failed` 상태에서는 새 샘플을 enqueue해도
-    /// 무시되므로, flushAndRemoveImage()로 실패 상태를 지워야 다시 그릴 수 있다. 레이어
-    /// 객체 자체를 새로 만들 필요는 없다.
     private func recoverDisplayLayerIfNeeded() {
         if displayLayer.status == .failed {
             displayLayer.flushAndRemoveImage()
@@ -383,8 +416,8 @@ final class CameraManager: NSObject, ObservableObject {
             let audioSettings: [String: Any] = [
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
                 AVNumberOfChannelsKey: 1,
-                AVSampleRateKey: 44100,
-                AVEncoderBitRateKey: 64000
+                AVSampleRateKey: 48_000,
+                AVEncoderBitRateKey: 64_000
             ]
             let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
             audioInput.expectsMediaDataInRealTime = true
@@ -447,8 +480,6 @@ final class CameraManager: NSObject, ObservableObject {
 
             let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: formatDescription)
             videoInput.expectsMediaDataInRealTime = true
-            // 압축 스트림이 이미 실측 세로 크기로 인코딩되어 있으므로 추가 회전이
-            // 필요 없다 — 여기서 회전 transform을 걸면 오히려 다시 돌아가 버린다.
             videoInput.transform = .identity
             guard writer.canAdd(videoInput) else { return }
             writer.add(videoInput)
