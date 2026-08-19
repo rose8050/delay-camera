@@ -1,0 +1,16 @@
+name: DelayCamera
+options:
+  bundleIdPrefix: com.example
+targets:
+  DelayCamera:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - DelayCamera
+    info:
+      path: DelayCamera/Info.plist
+      properties:
+        NSCameraUsageDescription: "지연 프리뷰 및 영상 녹화를 위해 카메라 접근 권한이 필요합니다."
+        NSMicrophoneUsageDescription: "영상 녹화 시 음성 기록을 위해 마이크 접근 권한이 필요합니다."
+        NSPhotoLibraryAddUsageDescription: "녹화된 영상을 사진 앱에 저장하기 위해 권한이 필요합니다."
