@@ -11,9 +11,6 @@ import Combine
 ///        ├─ video ──> H.264 압축(VTCompressionSession) ──> 지연 링버퍼 ──(N초 후 drain)──┬──> displayLayer (항상)
 ///        │                                                                              └──> AVAssetWriter video (녹화 중일 때만, passthrough — 재인코딩 없음)
 ///        └─ audio ──> 원본 그대로 ──> 지연 링버퍼 ──(같은 N초 기준 drain)──> AVAssetWriter audio (녹화 중일 때만, AAC로 트랜스코드)
-///
-/// 녹화 파이프라인은 대기 큐 + requestMediaDataWhenReady 패턴을 쓴다: writer가 순간적으로
-/// "아직 준비 안 됨" 상태여도 샘플을 버리지 않고 큐에 쌓아뒀다가, 준비되는 즉시 흘려보낸다.
 final class CameraManager: NSObject, ObservableObject {
 
     // MARK: Published UI state
@@ -73,13 +70,7 @@ final class CameraManager: NSObject, ObservableObject {
     private var writerSessionStarted = false
     private var recordingActive = false
 
-    /// writer가 순간적으로 안 준비된 상태여도 샘플을 잃지 않기 위한 대기 큐.
-    /// requestMediaDataWhenReady 콜백과 append 직후 모두 recordingQueue에서만 건드린다.
-    private var pendingVideoSamples: [CMSampleBuffer] = []
-    private var pendingAudioSamples: [CMSampleBuffer] = []
-    /// 정말 writer가 멈춰버린 극단적 상황(디스크 오류 등)에 대비한 방어적 상한.
-    private static let maxPendingSamples = 500
-
+    /// 진단용 카운터 — 콘솔에서 실제로 오디오가 얼마나 기록/드롭됐는지 확인하기 위함.
     private var debugAudioAppended = 0
     private var debugAudioDropped = 0
 
@@ -361,7 +352,6 @@ final class CameraManager: NSObject, ObservableObject {
             }
         }
 
-        // 오디오는 비디오보다 훨씬 촘촘하게 들어오므로, 이 틱까지 밀린 것을 전부(개수 제한 없이) 꺼낸다.
         audioDelayBufferLock.lock()
         var audioDueCount = 0
         for frame in audioDelayBuffer {
@@ -429,8 +419,6 @@ final class CameraManager: NSObject, ObservableObject {
             self.writerSessionStarted = false
             self.recordingStartPTS = nil
             self.recordingActive = true
-            self.pendingVideoSamples.removeAll()
-            self.pendingAudioSamples.removeAll()
             self.debugAudioAppended = 0
             self.debugAudioDropped = 0
 
@@ -450,8 +438,6 @@ final class CameraManager: NSObject, ObservableObject {
                 self.assetWriter = nil
                 self.assetWriterVideoInput = nil
                 self.assetWriterAudioInput = nil
-                self.pendingVideoSamples.removeAll()
-                self.pendingAudioSamples.removeAll()
                 DispatchQueue.main.async {
                     self.isRecording = false
                     self.recordingStartDate = nil
@@ -459,10 +445,6 @@ final class CameraManager: NSObject, ObservableObject {
                 }
                 return
             }
-
-            // 남은 대기 큐를 writer가 받아줄 수 있을 때까지 마저 흘려보낸다.
-            self.pumpPendingVideo()
-            self.pumpPendingAudio()
 
             self.assetWriterVideoInput?.markAsFinished()
             self.assetWriterAudioInput?.markAsFinished()
@@ -472,7 +454,7 @@ final class CameraManager: NSObject, ObservableObject {
 
             writer.finishWriting { [weak self] in
                 guard let self else { return }
-                print("[DelayCamera] 녹화 종료 — 오디오 프레임 기록: \(appended), drop: \(dropped), writer.status: \(writer.status.rawValue), error: \(writer.error?.localizedDescription ?? "없음")")
+                print("[DelayCamera] 녹화 종료 — 오디오 프레임 기록: \(appended), 드롭: \(dropped), writer.status: \(writer.status.rawValue), error: \(writer.error?.localizedDescription ?? "없음")")
                 DispatchQueue.main.async {
                     self.isRecording = false
                     self.recordingStartDate = nil
@@ -499,15 +481,9 @@ final class CameraManager: NSObject, ObservableObject {
             guard writer.canAdd(videoInput) else { return }
             writer.add(videoInput)
             assetWriterVideoInput = videoInput
-            videoInput.requestMediaDataWhenReady(on: recordingQueue) { [weak self] in
-                self?.pumpPendingVideo()
-            }
 
             if let audioInput = assetWriterAudioInput, writer.canAdd(audioInput) {
                 writer.add(audioInput)
-                audioInput.requestMediaDataWhenReady(on: recordingQueue) { [weak self] in
-                    self?.pumpPendingAudio()
-                }
             } else {
                 print("[DelayCamera] 오디오 input을 writer에 추가하지 못함 (canAdd == false)")
                 DispatchQueue.main.async { self.errorMessage = "오디오 트랙을 녹화에 추가하지 못했습니다." }
@@ -521,38 +497,20 @@ final class CameraManager: NSObject, ObservableObject {
         }
 
         guard let start = recordingStartPTS, CMSampleBufferGetPresentationTimeStamp(sampleBuffer) >= start else { return }
-        pendingVideoSamples.append(sampleBuffer)
-        if pendingVideoSamples.count > Self.maxPendingSamples {
-            pendingVideoSamples.removeFirst(pendingVideoSamples.count - Self.maxPendingSamples)
+        if assetWriterVideoInput?.isReadyForMoreMediaData == true {
+            assetWriterVideoInput?.append(sampleBuffer)
         }
-        pumpPendingVideo()
     }
 
     private func appendDelayedAudioIfRecording(_ sampleBuffer: CMSampleBuffer) {
         guard recordingActive, writerSessionStarted, let start = recordingStartPTS else { return }
         guard CMSampleBufferGetPresentationTimeStamp(sampleBuffer) >= start else { return }
-        pendingAudioSamples.append(sampleBuffer)
-        if pendingAudioSamples.count > Self.maxPendingSamples {
-            pendingAudioSamples.removeFirst(pendingAudioSamples.count - Self.maxPendingSamples)
-        }
-        pumpPendingAudio()
-    }
-
-    private func pumpPendingVideo() {
-        guard let videoInput = assetWriterVideoInput else { return }
-        while videoInput.isReadyForMoreMediaData, !pendingVideoSamples.isEmpty {
-            videoInput.append(pendingVideoSamples.removeFirst())
-        }
-    }
-
-    private func pumpPendingAudio() {
         guard let audioInput = assetWriterAudioInput else { return }
-        while audioInput.isReadyForMoreMediaData, !pendingAudioSamples.isEmpty {
-            if audioInput.append(pendingAudioSamples.removeFirst()) {
-                debugAudioAppended += 1
-            } else {
-                debugAudioDropped += 1
-            }
+
+        if audioInput.isReadyForMoreMediaData, audioInput.append(sampleBuffer) {
+            debugAudioAppended += 1
+        } else {
+            debugAudioDropped += 1
         }
     }
 
