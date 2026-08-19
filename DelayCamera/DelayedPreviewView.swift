@@ -1,8 +1,6 @@
 import SwiftUI
 import AVFoundation
 
-/// CameraManager.displayLayer(AVSampleBufferDisplayLayer)를 화면에 붙이기만 하는 뷰.
-/// 이 레이어에 무엇을, 언제 그릴지는 전적으로 CameraManager의 delay buffer가 결정한다.
 struct DelayedPreviewView: UIViewRepresentable {
     let displayLayer: AVSampleBufferDisplayLayer
 
@@ -27,6 +25,32 @@ final class PreviewContainerView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         displayLayer?.frame = bounds
+        CATransaction.commit()
+    }
+}
+
+struct GridOverlayView: View {
+    var body: some View {
+        GeometryReader { geometry in
+            Path { path in
+                let width = geometry.size.width
+                let height = geometry.size.height
+                for i in 1...2 {
+                    let x = width * CGFloat(i) / 3
+                    path.move(to: CGPoint(x: x, y: 0))
+                    path.addLine(to: CGPoint(x: x, y: height))
+
+                    let y = height * CGFloat(i) / 3
+                    path.move(to: CGPoint(x: 0, y: y))
+                    path.addLine(to: CGPoint(x: width, y: y))
+                }
+            }
+            .stroke(Color.white.opacity(0.45), lineWidth: 0.75)
+            .shadow(color: .black.opacity(0.35), radius: 1)
+        }
+        .allowsHitTesting(false)
     }
 }
