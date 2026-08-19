@@ -37,7 +37,7 @@ struct ContentView: View {
             case .background:
                 camera.handleWillResignActive()
             case .inactive:
-                break // 컨트롤 센터 등 일시적 전환은 무시 — 여기서 세션을 건드리면 깜빡임만 생긴다
+                break
             @unknown default:
                 break
             }
@@ -52,8 +52,6 @@ struct ContentView: View {
         }
     }
 
-    /// 상/하단 컨트롤이 배경과 상관없이 항상 또렷하게 보이도록 살짝 어둡게 깔아주는
-    /// 장식용 그라디언트. 터치에는 반응하지 않는다.
     private var edgeScrim: some View {
         VStack(spacing: 0) {
             LinearGradient(colors: [.black.opacity(0.32), .clear], startPoint: .top, endPoint: .bottom)
@@ -67,10 +65,6 @@ struct ContentView: View {
         .allowsHitTesting(false)
     }
 
-    /// ZStack 안에서 VStack + Spacer가 화면을 실제로 채우려면 명시적으로
-    /// maxWidth/maxHeight를 .infinity로 줘야 한다 — 이게 없으면 콘텐츠 크기만큼만
-    /// 차지한 채 ZStack 기본 정렬(가운데)로 얹혀서, 하단에 붙어야 할 컨트롤이
-    /// 화면 중앙 쪽에 떠 보이는 원인이 된다.
     private var controlsOverlay: some View {
         VStack {
             if camera.isRecording, let startDate = camera.recordingStartDate {
@@ -101,10 +95,8 @@ struct ContentView: View {
 
     private func toggleRecording() {
         if camera.isRecording {
-            Haptics.success()
             camera.stopRecording()
         } else {
-            Haptics.medium()
             camera.startRecording()
         }
     }
@@ -114,8 +106,6 @@ struct ContentView: View {
 
 private enum Haptics {
     static func light() { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
-    static func medium() { UIImpactFeedbackGenerator(style: .medium).impactOccurred() }
-    static func success() { UINotificationFeedbackGenerator().notificationOccurred(.success) }
 }
 
 // MARK: - 눌렀을 때 살짝 눌리는 듯한 탄성 피드백을 주는 버튼 스타일
@@ -128,7 +118,6 @@ private struct PressableButtonStyle: ButtonStyle {
     }
 }
 
-/// 지연 시간을 직접 선택하는 작은 세그먼트형 캡슐 (컴팩트 버전).
 private struct DelaySelector: View {
     let options: [Double]
     let selected: Double
@@ -167,7 +156,6 @@ private struct DelaySelector: View {
     }
 }
 
-/// 녹화 중임을 알리는 작은 배지 — 깜빡이는 점 + 실시간 경과 시간.
 private struct RecordingIndicator: View {
     let startDate: Date
     @State private var isPulsing = false
@@ -194,7 +182,6 @@ private struct RecordingIndicator: View {
     }
 }
 
-/// 녹화 시작/정지 버튼 (컴팩트 버전, 지름 약 48pt).
 private struct RecordButton: View {
     let isRecording: Bool
     let action: () -> Void
